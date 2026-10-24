@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 
 from . import config, decider, store
@@ -81,6 +82,13 @@ async def propose(b):
                               "callId": "call_" + sha(canon(d))[:40],
                               "action": dec["action"], "target": dec["target"],
                               "payload": dec["payload"], "evidence": dec["evidence"]})
+        if os.environ.get("LOG_SAMPLES", "1") == "1":  # synthetic exam data only: one example per action
+            shown = set()
+            for d, pr in zip(ds, proposals):
+                if pr["action"] not in shown and len(shown) < 6:
+                    shown.add(pr["action"])
+                    log.info("SAMPLE %s\n%s\nPROPOSAL %s", pr["action"], decider.render(d)[:3500],
+                             json.dumps({k: pr[k] for k in ("action", "target", "payload", "evidence")}))
         digest = sha(canon(ds))
         resp = {"profile": PROFILE, "evaluationId": eid, "status": "awaiting_receipts",
                 "inputDigest": digest, "proposals": proposals}
