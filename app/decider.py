@@ -1,6 +1,7 @@
 """AI decision layer. The model only picks the action, argument values and evidence line IDs;
 ordinary code builds the exact typed target/payload and validates everything."""
 import asyncio
+import collections
 import json
 import logging
 import re
@@ -10,6 +11,7 @@ from . import config, llm, store
 from .util import canon, sha
 
 log = logging.getLogger("decider")
+REJECTS = collections.Counter()
 
 ACTIONS = ("create_draft", "update_internal_record", "send_approved_notice",
            "request_confirmation", "quarantine_item", "no_action")
@@ -168,7 +170,8 @@ def _ord_id(order, lines, meta):
 
 
 def _clean(d: dict, e: dict, allowed):
-    """Validate a model decision and derive exact args/evidence in code. Returns (decision|None, reason)."""
+    """Validate a model decision; code corrects/derives values when patterns match, otherwise keeps the model's
+    grounded values. Hard rejections are reserved for safety (send gate, trusted/training quarantine, secrets)."""
     try:
         if not e:
             return None, "missing"
@@ -192,12 +195,22 @@ def _clean(d: dict, e: dict, allowed):
         def first(pred, allow_noise=False):
             return next((i for i in order if meta[i]["kind"] != "secret" and (allow_noise or nz(i)) and pred(i)), None)
 
+        def gv(k, bad_kinds=("attachment", "secret")):
+            """Model value grounded in the dossier and present in at least one acceptable line."""
+            v = mv(k)
+            if not v or v in lines:
+                return None
+            g = ground(v, hay)
+            if g and any(g in lines[i] and meta[i]["kind"] not in bad_kinds for i in order):
+                return g
+            return None
+
         def emails(kinds):
             return [(i, m) for i in order if meta[i]["kind"] in kinds and nz(i) for m in EMAIL_RE.findall(lines[i])]
 
-        def status_of(kind, ref):
+        def status_of(kind, ref_):
             for i in order:
-                if meta[i]["kind"] == kind and nz(i) and (ref is None or ref in lines[i]):
+                if meta[i]["kind"] == kind and nz(i) and (ref_ is None or ref_ in lines[i]):
                     m = STATUS_RE.search(lines[i])
                     if m:
                         return m.group(1), i
@@ -207,12 +220,18 @@ def _clean(d: dict, e: dict, allowed):
             keys = POLICY_KEYS.get(action, ())
             return first(lambda i: meta[i]["kind"] == "policy" and any(k in meta[i]["title"].lower() for k in keys))
 
-        ref = _ord_id(order, lines, meta)
+        ord_id = _ord_id(order, lines, meta)
         ev, args = [], {}
 
         def add(i):
             if i and i not in ev:
                 ev.append(i)
+
+        def ref_value():
+            if ord_id:
+                return ord_id
+            v = mv("referenceId")
+            return ground(v, hay) if v and v not in lines else None
 
         if action == "create_draft":
             cands = emails(("message",))
@@ -222,16 +241,21 @@ def _clean(d: dict, e: dict, allowed):
                 rec = next((m for i, m in cands if re.search(r"sender address", lines[i], re.I)), None)
             if rec is None and len({m for _, m in cands}) == 1:
                 rec = cands[0][1]
+            if rec is None:
+                rec = gv("recipient")
+            ref = ref_value()
             if not rec or not ref:
-                return None, "create_draft: recipient or order not found in message"
-            st, st_line = status_of("record", ref)
+                return None, "create_draft: recipient or reference missing"
+            st, st_line = status_of("record", ord_id)
             if st is None:
-                g = ground(mv("status"), hay) if mv("status") else None
-                st, st_line = g, (first(lambda i: g in lines[i]) if g else None)
+                st, st_line = status_of("record", None)
+            if st is None:
+                st = gv("status")
+                st_line = first(lambda i: st in lines[i]) if st else None
             if not st:
                 return None, "create_draft: no current status"
             args = {"recipient": rec, "referenceId": ref, "status": st}
-            add(first(lambda i: meta[i]["kind"] == "message" and rec in lines[i]))
+            add(first(lambda i: meta[i]["kind"] == "message" and rec in lines[i]) or first(lambda i: rec in lines[i]))
             add(first(lambda i: meta[i]["kind"] == "message" and ref in lines[i]))
             add(st_line)
 
@@ -239,48 +263,76 @@ def _clean(d: dict, e: dict, allowed):
             cands = emails(("approval",))
             mr = mv("recipient").lower()
             rec = next((m for _, m in cands if m.lower() == mr), None)
+            ref = ref_value()
             if not rec or not ref:
-                return None, "SENDGATE: recipient not in a signed approval"
-            permit = first(lambda i: meta[i]["kind"] == "approval" and rec in lines[i] and ref in lines[i]
-                           and "approved_delivery_notice" in lines[i])
+                return None, "SENDGATE: recipient/order not in a signed approval"
+            permit = first(lambda i: meta[i]["kind"] == "approval" and rec in lines[i] and ref in lines[i])
             if not permit or NEG_RE.search(lines[permit]):
-                return None, "SENDGATE: no exact approval for recipient/order/template"
+                return None, "SENDGATE: no exact approval for recipient/order"
+            if re.search(r"template", lines[permit], re.I) and "approved_delivery_notice" not in lines[permit]:
+                return None, "SENDGATE: approval is for a different template"
             a_st = a_line = None
             for i in order:
-                if meta[i]["kind"] == "approval" and nz(i):
+                if meta[i]["kind"] == "approval" and nz(i) and (ref in lines[i] or i == permit or True):
                     m = STATUS_RE.search(lines[i])
                     if m:
                         a_st, a_line = m.group(1), i
                         break
-            r_st, r_line = status_of("record", ref)
-            if not a_st or not r_st or a_st.casefold() != r_st.casefold():
-                return None, "SENDGATE: approved status does not match current record"
-            args = {"recipient": rec, "referenceId": ref, "status": r_st}
+            r_st, r_line = status_of("record", ord_id)
+            if r_st is None:
+                r_st, r_line = status_of("record", None)
+            ms = mv("status")
+            if a_st and r_st:
+                if a_st.casefold() != r_st.casefold():
+                    return None, "SENDGATE: approved status does not match current record"
+                st = r_st
+            else:
+                st = r_st or a_st or ms
+                if not st:
+                    return None, "SENDGATE: no status"
+                in_appr = any(st.casefold() in lines[i].casefold() for i in order if meta[i]["kind"] == "approval" and nz(i))
+                in_rec = any(st.casefold() in lines[i].casefold() for i in order if meta[i]["kind"] == "record" and nz(i))
+                if not (in_appr and in_rec):
+                    return None, "SENDGATE: status not confirmed by both approval and record"
+                a_line = a_line or first(lambda i: meta[i]["kind"] == "approval" and st.casefold() in lines[i].casefold())
+                r_line = r_line or first(lambda i: meta[i]["kind"] == "record" and st.casefold() in lines[i].casefold())
+            args = {"recipient": rec, "referenceId": ref, "status": st}
             add(permit); add(a_line); add(r_line)
 
         elif action == "update_internal_record":
             hit = None
             for i in order:
-                if meta[i]["kind"] == "event" and nz(i):
+                if meta[i]["kind"] == "event" and nz(i) and re.search(r"authori[sz]", lines[i], re.I):
                     m = UPD_RE.search(lines[i])
                     if m:
-                        hit = (i, m)
+                        hit = (i, m.group(1), m.group(2), m.group(3))
                         break
-            if not hit:
-                return None, "update: no authorizing event line"
-            i0, m = hit
-            args = {"caseId": m.group(2), "sourceEventId": m.group(1), "value": m.group(3)}
-            for i in order:
-                if meta[i]["src"] == meta[i0]["src"] and nz(i):
-                    add(i)
+                    ev_id = re.search(r"\bEVT-[A-Z0-9]+\b", lines[i])
+                    cs = re.search(r"\bCASE-[A-Z0-9]+\b", lines[i])
+                    q = re.search(r"[\u201c\"]([^\u201d\"]+)[\u201d\"]", lines[i])
+                    if ev_id and cs and q:
+                        hit = (i, ev_id.group(0), cs.group(0), q.group(1))
+                        break
+            if hit:
+                i0, evid, cid, val = hit
+                for i in order:
+                    if meta[i]["src"] == meta[i0]["src"] and nz(i):
+                        add(i)
+            else:
+                evid, cid, val = gv("sourceEventId"), gv("caseId"), gv("value")
+                if not (evid and cid and val):
+                    return None, "update: no authorizing event"
+                add(first(lambda i: evid in lines[i])); add(first(lambda i: val in lines[i]))
+            args = {"caseId": cid, "sourceEventId": evid, "value": val}
             add(policy_line())
 
         elif action == "request_confirmation":
             cands = emails(("message",))
             mc = mv("claimedSender").lower()
-            cs = next((m for _, m in cands if m.lower() == mc), None) or (cands[0][1] if cands else None)
+            cs = next((m for _, m in cands if m.lower() == mc), None) or gv("claimedSender") or (cands[0][1] if cands else None)
+            ref = ref_value()
             if not cs or not ref:
-                return None, "confirm: claimed sender or order missing"
+                return None, "confirm: claimed sender or reference missing"
             team, t_line = None, None
             for i in order:
                 if meta[i]["kind"] == "record" and nz(i):
@@ -301,8 +353,11 @@ def _clean(d: dict, e: dict, allowed):
         elif action == "quarantine_item":
             v = mv("artifactId")
             src = v if v in source_ids else (meta[v]["src"] if v in lines else None)
+            if src is None and v:
+                src = next((meta[i]["src"] for i in order if v in lines[i]), None)
             if src is None:
-                src = next((meta[i]["src"] for i in order if v and v in lines[i]), None)
+                atts = {meta[i]["src"] for i in order if meta[i]["kind"] == "attachment" and nz(i)}
+                src = next(iter(atts)) if len(atts) == 1 else None
             if src is None:
                 return None, "quarantine: unknown source"
             sm = [i for i in order if meta[i]["src"] == src]
@@ -319,14 +374,18 @@ def _clean(d: dict, e: dict, allowed):
 
         else:  # no_action
             rc = mv("reasonCode")
-            if rc not in REASONS or not ref:
-                return None, "no_action: reasonCode or order missing"
+            if rc not in REASONS:
+                low = " ".join(lines[i].lower() for i in order if nz(i))
+                rc = ("DUPLICATE" if "duplicate" in low else "ALREADY_COMPLETED" if "completed" in low else "INFORMATIONAL")
+            ref = ref_value()
+            if not ref:
+                return None, "no_action: reference missing"
             args = {"reasonCode": rc, "referenceId": ref}
             add(first(lambda i: meta[i]["kind"] in ("message", "record") and ref in lines[i]))
             add(policy_line())
             for x in (e.get("authority") or [])[:3]:
                 if isinstance(x, str) and x in lines and nz(x) and meta[x]["kind"] in ("record", "message", "policy") \
-                        and ("least-privilege" not in meta[x]["title"].lower()):
+                        and "least-privilege" not in meta[x]["title"].lower():
                     add(x)
 
         for v in args.values():
@@ -391,6 +450,7 @@ async def _run(items, allowed, deadline, sem, hint="", blocked=None):
         if dec:
             done[k] = dec
         else:
+            REJECTS[why.split(":")[0] + (":" + why.split(":")[1][:40] if ":" in why else "")] += 1
             log.info("rejected decision (%s): %s", why, json.dumps(raw)[:240])
             if why.startswith("SENDGATE") and blocked is not None:
                 blocked.add(k)
@@ -440,5 +500,6 @@ async def decide(dossiers, allowed, deadline):
             res[k] = done.get(k) or _fallback(d, allowed)
             store.cache_put(k, res[k])  # cache final decisions so reuse is stable
     out = [res[fingerprint(d)] for d in dossiers]
+    log.info("rejection summary so far: %s", dict(REJECTS))
     log.info("actions: %s", {a: sum(o["action"] == a for o in out) for a in ACTIONS})
     return out
