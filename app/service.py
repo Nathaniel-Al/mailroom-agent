@@ -120,12 +120,14 @@ async def commit(b):
     async with _lock(eid):
         row = store.get_eval(eid)
         if not row:
-            return _err(404, "unknown evaluation")
+            log.warning("commit rejected: unknown evaluation")
+            return _err(400, "unknown evaluation")
         try:  # validate every binding and signature first, atomically, even on an already-committed evaluation
             bad = _validate_commit(b, row)
         except Exception:
             bad = (400, "malformed receipts")
         if bad:
+            log.warning("commit rejected: %s", bad[1])
             return _err(*bad)
         h = sha(canon(b))
         if row["commit_resp"]:
