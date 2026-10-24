@@ -109,7 +109,7 @@ def _validate_commit(b, row):
         seen_d.add(r["dossierId"]); seen_c.add(r["callId"]); seen_r.add(r["receiptId"])
     for r in rs:  # verify EVERY signature before recording any effect
         if not verify_receipt(row["verifier"]["publicKeyJwk"], b["evaluationId"], b["inputDigest"], r):
-            return 403, "receipt signature invalid"
+            return 400, "receipt signature invalid"
     return None
 
 
@@ -121,14 +121,17 @@ async def commit(b):
         row = store.get_eval(eid)
         if not row:
             return _err(404, "unknown evaluation")
+        try:  # validate every binding and signature first, atomically, even on an already-committed evaluation
+            bad = _validate_commit(b, row)
+        except Exception:
+            bad = (400, "malformed receipts")
+        if bad:
+            return _err(*bad)
         h = sha(canon(b))
         if row["commit_resp"]:
             if row["commit_hash"] == h:
                 return 200, row["commit_resp"]  # exact replay: no repeated effect
             return _err(409, "evaluation already committed with different content")
-        bad = _validate_commit(b, row)
-        if bad:
-            return _err(*bad)
         by = {r["dossierId"]: r for r in b["receipts"]}
         outcomes = []
         for p in row["proposals"]:
