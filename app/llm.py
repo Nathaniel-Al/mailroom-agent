@@ -8,6 +8,21 @@ import httpx
 from . import config
 
 log = logging.getLogger("llm")
+_gate = asyncio.Lock()
+_state = {"next": 0.0}
+
+
+async def _throttle(t_end):
+    """Space model calls out globally (all evaluations share the provider's per-minute quota)."""
+    async with _gate:
+        now = time.monotonic()
+        start = max(now, _state["next"])
+        _state["next"] = start + config.LLM_MIN_INTERVAL
+    wait = start - now
+    if wait > 0:
+        if wait > t_end - now - 6:
+            raise TimeoutError("LLM throttle wait exceeds budget")
+        await asyncio.sleep(wait)
 RETRY = (429, 500, 502, 503, 504)
 
 
@@ -25,6 +40,8 @@ async def chat(system: str, user: str, timeout: float) -> str:
             left = t_end - time.monotonic()
             if left < 3:
                 raise TimeoutError("LLM time budget exhausted")
+            await _throttle(t_end)
+            left = t_end - time.monotonic()
             r = await c.post(config.LLM_BASE_URL + "/chat/completions",
                              headers={"Authorization": f"Bearer {config.LLM_API_KEY}"}, json=body, timeout=left)
             if r.status_code == 400:
