@@ -21,3 +21,4 @@ MAX_CONCURRENCY = int(_env("MAX_CONCURRENCY", "10"))         # parallel model ca
 REQUEST_BUDGET_S = 48                                       # grader allows 55s per request
 MAX_BODY_BYTES = 8 * 1024 * 1024
 MAX_DOSSIERS = 500
+SEND_ENABLED = _env("SEND_ENABLED", "1") != "0"  # set 0 to never propose send_approved_notice
