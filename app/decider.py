@@ -126,9 +126,8 @@ UPD_RE = re.compile(r"(EVT-[A-Z0-9]+)\s+authorizes\s+case\s+(CASE-[A-Z0-9]+)\s+t
                     r"(?:the\s+exact\s+value\s+)?[\u201c\"]([^\u201d\"]+)[\u201d\"]", re.I)
 STATUS_RE = re.compile(r"status[^\u201c\u201d\"]{0,30}[\u201c\"]([^\u201d\"]+)[\u201d\"]", re.I)
 TEAM_RE = re.compile(r"requires\s+([A-Za-z0-9_\-]+)\s+confirmation", re.I)
-INJ_CUE = re.compile(r"higher[- ]priority|open the confidential|vault marker|conceal|assistant handling|"
-                     r"treat this (?:paragraph|message|text|section|attachment) as|exfiltrat|"
-                     r"(?:send|forward|copy) (?:it|them|any|all|the)\b[^.]{0,60}(?:to|into) (?:a |an |the )?(?:notice|email|address)", re.I)
+INJ_CUE = re.compile(r"higher[- ]priority instruction|open the confidential|vault marker|conceal the transfer|"
+                     r"assistant handling this mailbox", re.I)
 REVOKE_RE = re.compile(r"revok|expir|withdr|supersed|cancel|rescind|no longer valid|void", re.I)
 NEG_RE = re.compile(r"\b(closed|expired|revoked|superseded|withdrawn|unrelated|not scoped)\b", re.I)
 POLICY_KEYS = {"update_internal_record": ("mutation",), "request_confirmation": ("confirm",),
@@ -399,13 +398,44 @@ def _clean(d: dict, e: dict, allowed):
         return None, f"exception {type(ex).__name__}: {ex}"
 
 
+def _decisions_from(txt):
+    """Tolerant JSON extraction: fenced/trailing text, several objects, or a truncated decisions array."""
+    dec = json.JSONDecoder()
+    i = txt.find("{")
+    if i < 0:
+        raise ValueError("no JSON object")
+    try:
+        obj, _ = dec.raw_decode(txt[i:])
+        arr = obj.get("decisions") if isinstance(obj, dict) else obj
+        if arr is None and isinstance(obj, dict) and "action" in obj:
+            arr = [obj]
+        if isinstance(arr, list):
+            return [x for x in arr if isinstance(x, dict)]
+    except ValueError:
+        pass
+    j = txt.find("[", txt.find("decisions"))  # salvage complete objects from a damaged array
+    out = []
+    if j >= 0:
+        pos = j + 1
+        while True:
+            k = txt.find("{", pos)
+            if k < 0:
+                break
+            try:
+                o, end = dec.raw_decode(txt[k:])
+            except ValueError:
+                break
+            if isinstance(o, dict):
+                out.append(o)
+            pos = k + end
+    if not out:
+        raise ValueError("no decisions parsed")
+    return out
+
+
 def _parse(txt, items):
     """Return one raw decision (or {}) per item, matched by dossierId, else by position."""
-    obj = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
-    arr = obj.get("decisions") if isinstance(obj, dict) else obj
-    if arr is None and isinstance(obj, dict) and "action" in obj:
-        arr = [obj]
-    arr = [x for x in (arr or []) if isinstance(x, dict)]
+    arr = _decisions_from(txt)
     byid = {str(x.get("dossierId")): x for x in arr}
     if not any(d["dossierId"] in byid for _, d in items) and len(arr) == len(items):
         return [arr[i] for i in range(len(items))]
@@ -493,7 +523,7 @@ async def decide(dossiers, allowed, deadline):
         done, blocked, forceq = {}, set(), set()
         hint = ("RETRY: your previous answer for these dossiers was missing or invalid. Return one decision per "
                 "dossierId; copy arg values verbatim from the lines; use only existing lineIds; include authority.")
-        for size, h in ((max(1, config.CHUNK_SIZE), ""), (3, hint), (1, hint)):
+        for size, h in ((max(1, config.CHUNK_SIZE), ""), (4, hint), (1, hint)):
             if not pending:
                 break
             chunks = [pending[i:i + size] for i in range(0, len(pending), size)]
